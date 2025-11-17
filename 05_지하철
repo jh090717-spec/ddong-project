@@ -1,0 +1,188 @@
+# ==========================================
+# streamlit_subway_top10.py
+# Streamlit 앱 (Streamlit Cloud 배포용)
+# 설명: 업로드한 CSV(혹은 기본 경로)를 읽어
+# 2025년 10월 중 사용자가 선택한 날짜와 호선의
+# 승차+하차 합계 기준 TOP10 역을 막대그래프로 표시합니다.
+# 플로틀리로 인터랙티브 차트 생성, 색상: 1등 똥색(갈색), 나머지는 핑크 그라데이션
+# ==========================================
+
+# -----------------
+# requirements.txt
+# -----------------
+# streamlit==1.25.0
+# pandas==2.2.2
+# plotly==5.15.0
+# (Streamlit Cloud에서는 최신 버전 사용 가능 — 위 버전은 권장 예시)
+
+# 사용법:
+# 1) 이 파일과 requirements.txt를 깃허브 리포지토리에 올려서 Streamlit Cloud에 배포하거나
+# 2) 로컬에서 실행: `pip install -r requirements.txt` 이후 `streamlit run streamlit_subway_top10.py`
+
+# ---------------------------------
+# 실제 Streamlit 앱 코드 시작
+# ---------------------------------
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from datetime import date
+from io import StringIO
+
+st.set_page_config(page_title="지하철 TOP10 시각화", layout='wide')
+
+st.title("🚇 지하철 역별 상위 10개 승객수 (2025년 10월)")
+st.markdown("업로드한 CSV 또는 기본 파일을 사용해 날짜와 호선을 선택하면 승차+하차 합계 기준 상위 10개 역을 보여줍니다.")
+
+# --- 파일 업로드 또는 기본 파일 사용 ---
+uploaded = st.file_uploader("CSV 파일 업로드 (인코딩: CP949 권장)", type=['csv'])
+use_default = False
+if uploaded is None:
+    st.info("파일을 업로드하지 않으면, 서버의 기본 경로 '/mnt/data/똥.csv' 를 시도합니다.")
+    use_default = st.checkbox("기본 파일('/mnt/data/똥.csv') 사용", value=True)
+
+# 데이터 로더 함수
+@st.cache_data
+def load_data(uploaded_file, use_default):
+    if uploaded_file is not None:
+        # pandas가 자동으로 바이너리 스트림을 처리하므로 인코딩 문제는 pandas에 맡김
+        try:
+            df = pd.read_csv(uploaded_file, encoding='cp949')
+        except Exception:
+            # 시도: utf-8
+            df = pd.read_csv(uploaded_file, encoding='utf-8')
+    else:
+        if use_default:
+            path = '/mnt/data/똥.csv'
+            df = pd.read_csv(path, encoding='cp949')
+        else:
+            return None
+
+    # 컬럼 정리
+    # 기대 컬럼: 사용일자, 노선명, 역명, 승차총승객수, 하차총승객수
+    expected = ['사용일자', '노선명', '역명', '승차총승객수', '하차총승객수']
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV에 다음 컬럼이 필요합니다: {missing}")
+
+    # 날짜 변환
+    df['사용일자'] = df['사용일자'].astype(str)
+    df['사용일자_dt'] = pd.to_datetime(df['사용일자'], format='%Y%m%d', errors='coerce')
+
+    # 승하차 numeric 강제
+    df['승차총승객수'] = pd.to_numeric(df['승차총승객수'], errors='coerce').fillna(0).astype(int)
+    df['하차총승객수'] = pd.to_numeric(df['하차총승객수'], errors='coerce').fillna(0).astype(int)
+
+    # 파생 변수
+    df['총합'] = df['승차총승객수'] + df['하차총승객수']
+
+    return df
+
+# 로드
+try:
+    df = load_data(uploaded, use_default)
+except Exception as e:
+    st.error(f"데이터 로드 실패: {e}")
+    st.stop()
+
+if df is None:
+    st.warning("데이터가 없습니다. CSV를 업로드하거나 기본 파일 사용을 체크하세요.")
+    st.stop()
+
+# 날짜 선택: 2025-10-01 ~ 2025-10-31
+min_date = date(2025,10,1)
+max_date = date(2025,10,31)
+selected_date = st.date_input("날짜 선택 (2025년 10월 중 하루)", value=min_date, min_value=min_date, max_value=max_date)
+
+# 노선 선택
+lines = sorted(df['노선명'].unique().tolist())
+selected_line = st.selectbox("호선 선택", options=['전체'] + lines)
+
+# 필터링
+mask_date = df['사용일자_dt'].dt.date == selected_date
+filtered = df[mask_date]
+if selected_line != '전체':
+    filtered = filtered[filtered['노선명'] == selected_line]
+
+if filtered.empty:
+    st.warning("선택 조건에 맞는 데이터가 없습니다.")
+    st.stop()
+
+# 역별 합계 집계
+agg = filtered.groupby(['노선명','역명'], as_index=False).agg({
+    '승차총승객수': 'sum',
+    '하차총승객수': 'sum',
+    '총합': 'sum'
+})
+
+top10 = agg.sort_values('총합', ascending=False).head(10).reset_index(drop=True)
+
+# 색상 구성: 1등 똥색(갈색), 나머지 9개는 핑크 그라데이션
+def make_pink_gradient(n, start_hex='#ff4da6', end_hex='#ffd6ea'):
+    # n >=1
+    def hex_to_rgb(h):
+        h = h.lstrip('#')
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    def rgb_to_hex(r,g,b):
+        return f"#{r:02x}{g:02x}{b:02x}"
+    s = hex_to_rgb(start_hex)
+    e = hex_to_rgb(end_hex)
+    colors = []
+    if n == 1:
+        colors.append(start_hex)
+    else:
+        for i in range(n):
+            t = i / (n-1)
+            rgb = (int(s[0] + (e[0]-s[0])*t), int(s[1] + (e[1]-s[1])*t), int(s[2] + (e[2]-s[2])*t))
+            colors.append(rgb_to_hex(*rgb))
+    return colors
+
+brown = '#8B5A2B'  # 똥색 계열 (갈색)
+pink_grad = make_pink_gradient(max(1, len(top10)-1))
+colors = [brown] + pink_grad
+
+# Plotly 막대그래프 (가로바, 1등 위)
+# 정렬: 큰 값이 위에 오도록 역명 순서를 뒤집어 출력
+top10_plot = top10.copy()
+# For horizontal bar with highest on top, reverse the DataFrame
+top10_plot = top10_plot.iloc[::-1]
+# assign colors in same reversed order so top item uses brown
+colors_for_plot = colors[::-1]
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=top10_plot['총합'],
+    y=top10_plot['역명'],
+    orientation='h',
+    text=top10_plot['총합'],
+    textposition='auto',
+    marker=dict(color=colors_for_plot),
+    hovertemplate='<b>%{y}</b><br>승차: %{customdata[0]}<br>하차: %{customdata[1]}<br>총합: %{x}<extra></extra>',
+    customdata=top10_plot[['승차총승객수','하차총승객수']].values
+))
+
+fig.update_layout(
+    title_text=f"{selected_date} - {selected_line} TOP10 (승차+하차 합)",
+    xaxis_title='승객 수',
+    yaxis_title='',
+    template='plotly_white',
+    height=600
+)
+
+# 출력
+st.plotly_chart(fig, use_container_width=True)
+
+with st.expander('상세 데이터 (TOP10)'):
+    st.dataframe(top10[['노선명','역명','승차총승객수','하차총승객수','총합']].reset_index(drop=True))
+
+st.markdown("---")
+st.caption('※ 색상: 1등은 똥색(갈색), 나머지는 핑크 계열의 그라데이션으로 표시됩니다.')
+
+# 다운로드: top10 CSV
+@st.cache_data
+def to_csv(df):
+    return df.to_csv(index=False).encode('utf-8-sig')
+
+csv = to_csv(top10[['노선명','역명','승차총승객수','하차총승객수','총합']])
+st.download_button('TOP10 CSV 다운로드', data=csv, file_name=f'top10_{selected_date}.csv', mime='text/csv')
+
+# 끝
